@@ -10,7 +10,7 @@ import { getNawrasIntegrationStatus } from "./services/integration";
 
 export default function App() {
   const auth = useAuth();
-  const chat = useChat();
+  const chat = useChat(auth.session?.user.id ?? null);
   const [accountError, setAccountError] = useState<string | null>(null);
   const integration = getNawrasIntegrationStatus();
   const connectionState = env.hasSupabaseConfig ? "configured" : "setup_required";

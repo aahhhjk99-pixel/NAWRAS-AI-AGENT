@@ -12,6 +12,13 @@ type ProviderResult = {
 };
 type ModelInfo = { id: string; name: string; contextLength?: number };
 
+class ProviderHttpError extends Error {
+  constructor(readonly provider: Provider, readonly status: number) {
+    super(`${provider} provider returned ${status}`);
+    this.name = "ProviderHttpError";
+  }
+}
+
 let openRouterCatalog: { expiresAt: number; models: ModelInfo[] } | null = null;
 const CATALOG_TTL_MS = 10 * 60 * 1000;
 const MAX_CATALOG_MODELS = 250;
@@ -145,7 +152,7 @@ async function callGemini(messages: ChatMessage[], taskType: TaskType): Promise<
     }
   );
   const data = await readJson(response);
-  if (!response.ok) throw new Error(`Gemini provider returned ${response.status}`);
+  if (!response.ok) throw new ProviderHttpError("gemini", response.status);
   return {
     reply: data.candidates?.[0]?.content?.parts?.map((part: { text?: string }) => part.text ?? "").join("") ?? "",
     provider: "Google Gemini",
@@ -175,7 +182,7 @@ async function callGroq(messages: ChatMessage[], taskType: TaskType): Promise<Pr
     signal: AbortSignal.timeout(30000)
   });
   const data = await readJson(response);
-  if (!response.ok) throw new Error(`Groq provider returned ${response.status}`);
+  if (!response.ok) throw new ProviderHttpError("groq", response.status);
   return {
     reply: data.choices?.[0]?.message?.content ?? "",
     provider: "Groq",
@@ -242,7 +249,7 @@ async function callOpenRouter(messages: ChatMessage[], taskType: TaskType, reque
     signal: AbortSignal.timeout(40000)
   });
   const data = await readJson(response);
-  if (!response.ok) throw new Error(`OpenRouter provider returned ${response.status}`);
+  if (!response.ok) throw new ProviderHttpError("openrouter", response.status);
   const content = data.choices?.[0]?.message?.content;
   const reply = typeof content === "string"
     ? content
@@ -285,6 +292,7 @@ Deno.serve(async (request: Request) => {
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(request) });
   if (request.method !== "POST") return json(request, { error: "طريقة الطلب غير مدعومة." }, 405);
 
+  let activeProvider: Provider | undefined;
   try {
     const body = await request.json();
     if (!callerAllowed(request)) {
@@ -309,6 +317,7 @@ Deno.serve(async (request: Request) => {
     const configuredDefault = Deno.env.get("AI_DEFAULT_PROVIDER")?.toLowerCase();
     const provider = (body?.provider ?? configuredDefault ?? "gemini") as Provider;
     if (!providers.includes(provider)) return json(request, { error: "مزود الذكاء الاصطناعي غير مدعوم." }, 400);
+    activeProvider = provider;
 
     const requestedTaskType = body?.taskType;
     const taskType: TaskType = requestedTaskType === "analysis" || requestedTaskType === "planning"
@@ -332,7 +341,11 @@ Deno.serve(async (request: Request) => {
     if (message.includes("is not configured")) {
       return json(request, { error: "مفتاح هذا المزود غير مهيأ على الخادم." }, 503);
     }
-    console.error("AI provider request failed", error instanceof Error ? error.name : "unknown");
+    console.error("AI provider request failed", JSON.stringify({
+      provider: error instanceof ProviderHttpError ? error.provider : activeProvider ?? "unknown",
+      ...(error instanceof ProviderHttpError ? { status: error.status } : {}),
+      errorName: error instanceof Error ? error.name : "unknown"
+    }));
     return json(request, { error: "تعذر إكمال الطلب لدى المزود المحدد. تحقق من توفر النموذج ومفتاحه ثم أعد المحاولة." }, 503);
   }
 });

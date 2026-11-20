@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { sendAiMessage } from "../services/ai";
 import { friendlyError, makeId } from "../lib/utils";
 import type { AiProvider, ChatMessage } from "../types/app";
@@ -11,14 +11,23 @@ const welcome: ChatMessage = {
   createdAt: new Date().toISOString()
 };
 
-export function useChat() {
+export function useChat(sessionKey: string | null) {
   const [messages, setMessages] = useState<ChatMessage[]>([welcome]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const sessionGeneration = useRef(0);
+
+  useEffect(() => {
+    sessionGeneration.current += 1;
+    setMessages([welcome]);
+    setLoading(false);
+    setError(null);
+  }, [sessionKey]);
 
   const send = useCallback(async (content: string, provider: AiProvider, model?: string) => {
     const trimmed = content.trim();
     if (!trimmed || loading) return;
+    const requestGeneration = sessionGeneration.current;
 
     const userMessage: ChatMessage = {
       id: makeId(),
@@ -42,6 +51,8 @@ export function useChat() {
         taskType: provider === "gemini" ? "analysis" : "general"
       });
 
+      if (requestGeneration !== sessionGeneration.current) return;
+
       const assistantMessage: ChatMessage = {
         id: makeId(),
         role: "assistant",
@@ -53,9 +64,9 @@ export function useChat() {
 
       setMessages((current) => [...current, assistantMessage]);
     } catch (cause) {
-      setError(friendlyError(cause));
+      if (requestGeneration === sessionGeneration.current) setError(friendlyError(cause));
     } finally {
-      setLoading(false);
+      if (requestGeneration === sessionGeneration.current) setLoading(false);
     }
   }, [messages, loading]);
 

@@ -2,14 +2,19 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
 type Role = "user" | "assistant";
 type ChatMessage = { role: Role; content: string };
-type Provider = "openai" | "gemini" | "anthropic";
-
+type Provider = "gemini" | "groq" | "openrouter";
+type TaskType = "general" | "analysis" | "planning";
 type ProviderResult = {
   reply: string;
   provider: string;
   model: string;
   usage?: { inputTokens?: number; outputTokens?: number };
 };
+type ModelInfo = { id: string; name: string; contextLength?: number };
+
+let openRouterCatalog: { expiresAt: number; models: ModelInfo[] } | null = null;
+const CATALOG_TTL_MS = 10 * 60 * 1000;
+const MAX_CATALOG_MODELS = 250;
 
 function allowedOrigins(): Set<string> {
   return new Set(
@@ -37,6 +42,35 @@ function json(request: Request, body: unknown, status = 200): Response {
     status,
     headers: { ...corsHeaders(request), "Content-Type": "application/json; charset=utf-8" }
   });
+}
+
+function decodeJwtPayload(request: Request): Record<string, unknown> | null {
+  const token = request.headers.get("Authorization")?.replace(/^Bearer\s+/i, "");
+  if (!token) return null;
+  const payloadPart = token.split(".")[1];
+  if (!payloadPart) return null;
+  try {
+    const base64 = payloadPart.replace(/-/g, "+").replace(/_/g, "/");
+    const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, "=");
+    const value = JSON.parse(atob(padded));
+    return typeof value === "object" && value !== null ? value as Record<string, unknown> : null;
+  } catch {
+    return null;
+  }
+}
+
+function callerAllowed(request: Request): boolean {
+  // The Supabase Edge gateway verifies the JWT signature because verify_jwt=true.
+  // This function then applies the owner-configured email allowlist.
+  const allowedEmails = new Set(
+    (Deno.env.get("AI_ALLOWED_EMAILS") ?? "")
+      .split(",")
+      .map((email) => email.trim().toLowerCase())
+      .filter(Boolean)
+  );
+  if (allowedEmails.size === 0) return false;
+  const email = decodeJwtPayload(request)?.email;
+  return typeof email === "string" && allowedEmails.has(email.toLowerCase());
 }
 
 function safeMessages(value: unknown): ChatMessage[] | null {
@@ -74,42 +108,25 @@ const systemInstruction = `
 إذا لم تتوفر بيانات أو واجهة مؤكدة، صرّح بذلك بوضوح.
 `;
 
+function taskInstruction(taskType: TaskType): string {
+  if (taskType === "analysis") return "حلّل الطلب بعمق، وميّز بين الحقائق والافتراضات، ثم اقترح خيارات عملية واضحة.";
+  if (taskType === "planning") return "حوّل الطلب إلى خطة مرتبة بمراحل وقرارات ومخاطر قابلة للمراجعة.";
+  return "أجب مباشرة وبوضوح مع مراعاة سياق المستخدم.";
+}
+
 async function readJson(response: Response): Promise<Record<string, any>> {
   return await response.json().catch(() => ({}));
 }
 
-async function callOpenAI(messages: ChatMessage[]): Promise<ProviderResult> {
-  const key = Deno.env.get("OPENAI_API_KEY");
-  if (!key) throw new Error("OpenAI is not configured");
-  const model = Deno.env.get("OPENAI_MODEL") || "gpt-4o-mini";
-  const response = await fetch("https://api.openai.com/v1/chat/completions", {
-    method: "POST",
-    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model,
-      messages: [{ role: "system", content: systemInstruction }, ...messages],
-      temperature: 0.3,
-      max_tokens: 1200
-    }),
-    signal: AbortSignal.timeout(30000)
-  });
-  const data = await readJson(response);
-  if (!response.ok) throw new Error(`OpenAI error ${response.status}`);
-  return {
-    reply: data.choices?.[0]?.message?.content ?? "",
-    provider: "OpenAI",
-    model,
-    usage: {
-      inputTokens: data.usage?.prompt_tokens,
-      outputTokens: data.usage?.completion_tokens
-    }
-  };
+function requireProviderKey(name: string, label: string): string {
+  const key = Deno.env.get(name);
+  if (!key) throw new Error(`${label} is not configured`);
+  return key;
 }
 
-async function callGemini(messages: ChatMessage[]): Promise<ProviderResult> {
-  const key = Deno.env.get("GEMINI_API_KEY");
-  if (!key) throw new Error("Gemini is not configured");
-  const model = Deno.env.get("GEMINI_MODEL") || "gemini-2.0-flash";
+async function callGemini(messages: ChatMessage[], taskType: TaskType): Promise<ProviderResult> {
+  const key = requireProviderKey("GEMINI_API_KEY", "Gemini");
+  const model = Deno.env.get("GEMINI_MODEL") || "gemini-flash-latest";
   const contents = messages.map((message) => ({
     role: message.role === "assistant" ? "model" : "user",
     parts: [{ text: message.content }]
@@ -120,7 +137,7 @@ async function callGemini(messages: ChatMessage[]): Promise<ProviderResult> {
       method: "POST",
       headers: { "Content-Type": "application/json", "x-goog-api-key": key },
       body: JSON.stringify({
-        systemInstruction: { parts: [{ text: systemInstruction }] },
+        systemInstruction: { parts: [{ text: `${systemInstruction}\n${taskInstruction(taskType)}` }] },
         contents,
         generationConfig: { temperature: 0.3, maxOutputTokens: 1200 }
       }),
@@ -128,7 +145,7 @@ async function callGemini(messages: ChatMessage[]): Promise<ProviderResult> {
     }
   );
   const data = await readJson(response);
-  if (!response.ok) throw new Error(`Gemini error ${response.status}`);
+  if (!response.ok) throw new Error(`Gemini provider returned ${response.status}`);
   return {
     reply: data.candidates?.[0]?.content?.parts?.map((part: { text?: string }) => part.text ?? "").join("") ?? "",
     provider: "Google Gemini",
@@ -140,91 +157,182 @@ async function callGemini(messages: ChatMessage[]): Promise<ProviderResult> {
   };
 }
 
-async function callAnthropic(messages: ChatMessage[]): Promise<ProviderResult> {
-  const key = Deno.env.get("ANTHROPIC_API_KEY");
-  if (!key) throw new Error("Anthropic is not configured");
-  const model = Deno.env.get("ANTHROPIC_MODEL") || "claude-3-5-haiku-latest";
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+async function callGroq(messages: ChatMessage[], taskType: TaskType): Promise<ProviderResult> {
+  const key = requireProviderKey("GROQ_API_KEY", "Groq");
+  const model = Deno.env.get("GROQ_MODEL") || "llama-3.1-8b-instant";
+  const response = await fetch("https://api.groq.com/openai/v1/chat/completions", {
     method: "POST",
-    headers: {
-      "x-api-key": key,
-      "anthropic-version": "2023-06-01",
-      "content-type": "application/json"
-    },
+    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
     body: JSON.stringify({
       model,
-      system: systemInstruction,
-      messages,
-      max_tokens: 1200,
-      temperature: 0.3
+      messages: [
+        { role: "system", content: `${systemInstruction}\n${taskInstruction(taskType)}` },
+        ...messages
+      ],
+      temperature: 0.3,
+      max_tokens: 1200
     }),
     signal: AbortSignal.timeout(30000)
   });
   const data = await readJson(response);
-  if (!response.ok) throw new Error(`Anthropic error ${response.status}`);
+  if (!response.ok) throw new Error(`Groq provider returned ${response.status}`);
   return {
-    reply: data.content?.map((part: { type: string; text?: string }) => part.type === "text" ? part.text ?? "" : "").join("") ?? "",
-    provider: "Anthropic",
+    reply: data.choices?.[0]?.message?.content ?? "",
+    provider: "Groq",
     model,
     usage: {
-      inputTokens: data.usage?.input_tokens,
-      outputTokens: data.usage?.output_tokens
+      inputTokens: data.usage?.prompt_tokens,
+      outputTokens: data.usage?.completion_tokens
     }
   };
 }
 
-const providerKeys: Record<Provider, string> = {
-  openai: "OPENAI_API_KEY",
-  gemini: "GEMINI_API_KEY",
-  anthropic: "ANTHROPIC_API_KEY"
-};
+async function getOpenRouterModels(forceRefresh = false): Promise<ModelInfo[]> {
+  const key = requireProviderKey("OPENROUTER_API_KEY", "OpenRouter");
+  if (!forceRefresh && openRouterCatalog && openRouterCatalog.expiresAt > Date.now()) {
+    return openRouterCatalog.models;
+  }
+
+  const response = await fetch("https://openrouter.ai/api/v1/models?limit=500", {
+    headers: { Authorization: `Bearer ${key}` },
+    signal: AbortSignal.timeout(20000)
+  });
+  const data = await readJson(response);
+  if (!response.ok || !Array.isArray(data.data)) throw new Error(`OpenRouter model catalog returned ${response.status}`);
+
+  const models: ModelInfo[] = data.data
+    .filter((item: Record<string, any>) => {
+      if (typeof item.id !== "string" || item.id.length > 200) return false;
+      const inputs = item.architecture?.input_modalities;
+      const outputs = item.architecture?.output_modalities;
+      return (!Array.isArray(inputs) || inputs.includes("text"))
+        && (!Array.isArray(outputs) || outputs.includes("text"));
+    })
+    .slice(0, MAX_CATALOG_MODELS)
+    .map((item: Record<string, any>) => ({
+      id: item.id,
+      name: typeof item.name === "string" && item.name.length <= 160 ? item.name : item.id,
+      ...(typeof item.context_length === "number" ? { contextLength: item.context_length } : {})
+    }));
+
+  openRouterCatalog = { expiresAt: Date.now() + CATALOG_TTL_MS, models };
+  return models;
+}
+
+async function callOpenRouter(messages: ChatMessage[], taskType: TaskType, requestedModel: unknown): Promise<ProviderResult> {
+  const key = requireProviderKey("OPENROUTER_API_KEY", "OpenRouter");
+  if (typeof requestedModel !== "string" || requestedModel.length > 200) {
+    throw new Error("OpenRouter model is required");
+  }
+  const models = await getOpenRouterModels();
+  if (!models.some((model) => model.id === requestedModel)) throw new Error("OpenRouter model is not in the server catalog");
+
+  const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${key}`, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: requestedModel,
+      messages: [
+        { role: "system", content: `${systemInstruction}\n${taskInstruction(taskType)}` },
+        ...messages
+      ],
+      temperature: 0.3,
+      max_tokens: 1200
+    }),
+    signal: AbortSignal.timeout(40000)
+  });
+  const data = await readJson(response);
+  if (!response.ok) throw new Error(`OpenRouter provider returned ${response.status}`);
+  const content = data.choices?.[0]?.message?.content;
+  const reply = typeof content === "string"
+    ? content
+    : Array.isArray(content)
+      ? content.map((part: { text?: string }) => part.text ?? "").join("")
+      : "";
+  return {
+    reply,
+    provider: "OpenRouter",
+    model: requestedModel,
+    usage: {
+      inputTokens: data.usage?.prompt_tokens,
+      outputTokens: data.usage?.completion_tokens
+    }
+  };
+}
+
+function providerCapabilities() {
+  return {
+    gemini: {
+      available: Boolean(Deno.env.get("GEMINI_API_KEY")),
+      model: Deno.env.get("GEMINI_MODEL") || "gemini-flash-latest"
+    },
+    groq: {
+      available: Boolean(Deno.env.get("GROQ_API_KEY")),
+      model: Deno.env.get("GROQ_MODEL") || "llama-3.1-8b-instant"
+    },
+    openrouter: {
+      available: Boolean(Deno.env.get("OPENROUTER_API_KEY")),
+      model: "catalog"
+    }
+  };
+}
 
 Deno.serve(async (request: Request) => {
   const origin = request.headers.get("Origin");
   if (origin && !allowedOrigins().has(origin)) {
-    return json(request, { error: "Origin is not allowed" }, 403);
+    return json(request, { error: "هذا الأصل غير مسموح له بالاتصال بالخدمة." }, 403);
   }
   if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(request) });
-  if (request.method !== "POST") return json(request, { error: "Method not allowed" }, 405);
+  if (request.method !== "POST") return json(request, { error: "طريقة الطلب غير مدعومة." }, 405);
 
   try {
     const body = await request.json();
-    const messages = safeMessages(body?.messages);
-    if (!messages) return json(request, { error: "Invalid messages payload" }, 400);
-
-    // Supabase verifies the caller's JWT by default. Never accept provider URLs or keys from the client.
-    const providers: Provider[] = ["openai", "gemini", "anthropic"];
-    const configured = Deno.env.get("AI_DEFAULT_PROVIDER")?.toLowerCase();
-    const preferred: Provider = providers.includes(configured as Provider)
-      ? configured as Provider
-      : "openai";
-    const order = [preferred, ...providers.filter((provider) => provider !== preferred)]
-      .filter((provider) => Boolean(Deno.env.get(providerKeys[provider])));
-
-    if (order.length === 0) {
-      return json(request, { error: "لم يتم إعداد أي مزود ذكاء اصطناعي على الخادم." }, 503);
+    if (!callerAllowed(request)) {
+      return json(request, { error: "الحساب غير مصرح له باستخدام المساعد." }, 403);
     }
 
-    let lastProvider: Provider | undefined;
-    for (const provider of order) {
-      lastProvider = provider;
-      try {
-        const result = provider === "openai"
-          ? await callOpenAI(messages)
-          : provider === "gemini"
-            ? await callGemini(messages)
-            : await callAnthropic(messages);
-
-        if (!result.reply.trim()) throw new Error("Provider returned an empty response");
-        return json(request, result);
-      } catch (error) {
-        console.error("AI provider request failed", provider, error instanceof Error ? error.name : "unknown");
+    if (body?.action === "capabilities") {
+      return json(request, { providers: providerCapabilities() });
+    }
+    if (body?.action === "models") {
+      if (!Deno.env.get("OPENROUTER_API_KEY")) {
+        return json(request, { error: "OpenRouter غير مهيأ على الخادم." }, 503);
       }
+      const models = await getOpenRouterModels(true);
+      return json(request, { models });
     }
 
-    console.error("No configured AI provider completed the request", lastProvider ?? "unknown");
-    return json(request, { error: "تعذر الوصول إلى مزود ذكاء اصطناعي متاح. راجع إعدادات الخادم." }, 503);
-  } catch {
-    return json(request, { error: "الطلب غير صالح أو تعذر معالجته." }, 400);
+    const messages = safeMessages(body?.messages);
+    if (!messages) return json(request, { error: "صيغة الرسائل غير صالحة." }, 400);
+
+    const providers: Provider[] = ["gemini", "groq", "openrouter"];
+    const configuredDefault = Deno.env.get("AI_DEFAULT_PROVIDER")?.toLowerCase();
+    const provider = (body?.provider ?? configuredDefault ?? "gemini") as Provider;
+    if (!providers.includes(provider)) return json(request, { error: "مزود الذكاء الاصطناعي غير مدعوم." }, 400);
+
+    const requestedTaskType = body?.taskType;
+    const taskType: TaskType = requestedTaskType === "analysis" || requestedTaskType === "planning"
+      ? requestedTaskType
+      : "general";
+    const available = providerCapabilities()[provider].available;
+    if (!available) return json(request, { error: `المزود ${provider} غير مهيأ بمفتاح صالح على الخادم.` }, 503);
+
+    let result: ProviderResult;
+    if (provider === "gemini") result = await callGemini(messages, taskType);
+    else if (provider === "groq") result = await callGroq(messages, taskType);
+    else result = await callOpenRouter(messages, taskType, body?.model);
+
+    if (!result.reply.trim()) throw new Error("Provider returned an empty response");
+    return json(request, result);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown";
+    if (message.includes("is not in the server catalog") || message.includes("model is required")) {
+      return json(request, { error: "النموذج المختار غير موجود في قائمة OpenRouter الحالية. حدّث القائمة ثم جرّب مجدداً." }, 400);
+    }
+    if (message.includes("is not configured")) {
+      return json(request, { error: "مفتاح هذا المزود غير مهيأ على الخادم." }, 503);
+    }
+    console.error("AI provider request failed", error instanceof Error ? error.name : "unknown");
+    return json(request, { error: "تعذر إكمال الطلب لدى المزود المحدد. تحقق من توفر النموذج ومفتاحه ثم أعد المحاولة." }, 503);
   }
 });

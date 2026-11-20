@@ -15,7 +15,7 @@ export function Sidebar({ connectionState }: { connectionState: ConnectionState 
     <aside className="sidebar">
       <a className="brand" href="#main" aria-label="النورس - الصفحة الرئيسية">
         <span className="brand-logo-wrap">
-          <img src="/brand/nawras-logo.png" alt="شعار النورس" />
+          <img src={`${import.meta.env.BASE_URL}brand/nawras-logo.png`} alt="شعار النورس" />
         </span>
         <span className="brand-copy">
           <strong>النورس</strong>

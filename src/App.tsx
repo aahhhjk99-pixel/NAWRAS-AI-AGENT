@@ -1,14 +1,44 @@
-import { ShieldCheck } from "lucide-react";
+import { useState } from "react";
+import { LogOut, ShieldCheck } from "lucide-react";
+import { AuthScreen } from "./components/AuthScreen";
 import { Sidebar } from "./components/Sidebar";
 import { ChatPanel } from "./components/ChatPanel";
+import { useAuth } from "./hooks/useAuth";
 import { useChat } from "./hooks/useChat";
 import { env } from "./config/env";
 import { getNawrasIntegrationStatus } from "./services/integration";
 
 export default function App() {
+  const auth = useAuth();
   const chat = useChat();
+  const [accountError, setAccountError] = useState<string | null>(null);
   const integration = getNawrasIntegrationStatus();
   const connectionState = env.hasSupabaseConfig ? "configured" : "setup_required";
+
+  if (auth.loading) {
+    return (
+      <main className="app-loading" dir="rtl" role="status">
+        <span className="auth-logo"><img src={`${import.meta.env.BASE_URL}brand/nawras-logo.png`} alt="" /></span>
+        <ShieldCheck size={20} /> جارٍ التحقق من الجلسة...
+      </main>
+    );
+  }
+
+  if (!auth.session) {
+    return <AuthScreen configured={env.hasSupabaseConfig} busy={auth.loading} onSignIn={auth.signIn} />;
+  }
+
+  async function signOut() {
+    setAccountError(null);
+    try {
+      await auth.signOut();
+    } catch {
+      setAccountError("تعذر إنهاء الجلسة الآن. حاول مرة أخرى.");
+    }
+  }
+
+  const email = auth.session.user.email ?? "حساب مصادق عليه";
+  const avatar = email.slice(0, 1).toUpperCase();
 
   return (
     <div className="app-shell">
@@ -19,9 +49,12 @@ export default function App() {
           <div className="top-actions">
             <span className="environment-tag">مساعد العمليات</span>
             <div className="user-chip" aria-label="حالة الحساب">
-              <span className="user-avatar">ن</span>
-              <div><strong>مساحة العمل</strong><small>لا توجد بيانات حساب تجريبية</small></div>
+              <span className="user-avatar">{avatar}</span>
+              <div><strong>حساب نشط</strong><small dir="ltr">{email}</small></div>
             </div>
+            <button className="logout-button" type="button" onClick={() => void signOut()} aria-label="تسجيل الخروج">
+              <LogOut size={16} /><span>خروج</span>
+            </button>
           </div>
         </header>
 
@@ -39,6 +72,7 @@ export default function App() {
             <strong>تكامل النورس: معاينة فقط</strong>
             <span>{integration.note}</span>
           </div>
+          {accountError && <div className="error-banner" role="alert">{accountError}</div>}
 
           <ChatPanel
             messages={chat.messages}
@@ -47,7 +81,7 @@ export default function App() {
             onSend={chat.send}
           />
           <p className="workspace-footnote">
-            إرسال الرسائل يتطلب إعداد Supabase وجلسة دخول مصرحاً بها. المفاتيح السرية تبقى في الخادم.
+            الخدمة تتطلب جلسة دخول مصادقاً عليها؛ مفاتيح المزودات تبقى على الخادم ولا تظهر في المتصفح.
           </p>
         </div>
       </main>

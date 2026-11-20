@@ -1,7 +1,7 @@
 import { useCallback, useState } from "react";
 import { sendAiMessage } from "../services/ai";
 import { friendlyError, makeId } from "../lib/utils";
-import type { ChatMessage } from "../types/app";
+import type { AiProvider, ChatMessage } from "../types/app";
 
 const welcome: ChatMessage = {
   id: "welcome",
@@ -16,7 +16,7 @@ export function useChat() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  const send = useCallback(async (content: string) => {
+  const send = useCallback(async (content: string, provider: AiProvider, model?: string) => {
     const trimmed = content.trim();
     if (!trimmed || loading) return;
 
@@ -37,7 +37,9 @@ export function useChat() {
         messages: next
           .filter((message) => message.id !== "welcome")
           .map(({ role, content: text }) => ({ role, content: text })),
-        taskType: "general"
+        provider,
+        ...(provider === "openrouter" && model ? { model } : {}),
+        taskType: provider === "gemini" ? "analysis" : "general"
       });
 
       const assistantMessage: ChatMessage = {
